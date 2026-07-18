@@ -1,296 +1,289 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from scipy.sparse import coo_matrix
+from scipy.sparse.linalg import splu
 from scipy.interpolate import CubicSpline
-from scipy.interpolate import RegularGridInterpolator
+import time
 
 # ==========================================================================
-# 1. PARÁMETROS GEOMÉTRICOS
-#    (medidas correctas, tomadas del solucionador de Newton-Raphson)
+# 1. PARÁMETROS
 # ==========================================================================
-h_real = 5.0                      # tamaño de celda de la malla de cálculo
-Nx = 81                           # nodos en x de la malla de cálculo
-Ny = 9                            # nodos en y de la malla de cálculo
-Lx = (Nx - 1) * h_real            # 400 -> longitud real del canal en x
-Ly = (Ny - 1) * h_real            # 40  -> longitud real del canal en y
+h_grueso = 5.0
+Nx_g, Ny_g = 81, 9                       # malla gruesa: 81 x 9 nodos
+h_fino = 1.0                             # resolución real del canal
+Lx, Ly = (Nx_g - 1) * h_grueso, (Ny_g - 1) * h_grueso   # 400 x 40 (igual en ambas mallas)
 
-U0 = 1.0                          # velocidad de entrada
-omega = 0.85                      # factor de relajación (SOR)
-g = 0.3                           # coeficiente de convección simplificado
-tol = 1e-6
-max_iter = 10000
+U0 = 1.0
+nu = 1.5                                 # viscosidad cinemática (controla la vorticidad)
+Re = U0 * Ly / nu
 
 print("=" * 70)
-print("  Recuperación de tamaño original - Spline Cúbico Natural")
+print("  Canal con obstáculos de tamaño real - vorticidad + recuperación con spline")
 print("=" * 70)
-print(f"  Malla de cálculo (gruesa): {Nx} x {Ny} nodos, h = {h_real}")
-print(f"  Dominio real del canal:    {Lx:.0f} x {Ly:.0f} unidades")
+print(f"  Dominio real:  {Lx:.0f} x {Ly:.0f}")
+print(f"  Malla gruesa (cálculo):     {Nx_g} x {Ny_g}  (h = {h_grueso})")
+print(f"  Malla fina (recuperación):  {int(Lx/h_fino)+1} x {int(Ly/h_fino)+1}  (h = {h_fino})")
+print(f"  Re = U0*Ly/nu = {Re:.1f}")
 print("=" * 70)
 
 
 # ==========================================================================
-# 2. MÁSCARA DE OBSTÁCULOS EN LA MALLA GRUESA
-#    (misma geometría que el código original de Gauss-Seidel:
-#     superior izquierdo -> i <= 9 y j >= 6
-#     inferior central   -> 35 <= i <= 44 y j <= 1)
+# 2. SOLVER GENÉRICO: FUNCIÓN DE CORRIENTE - VORTICIDAD
 # ==========================================================================
-def build_solid_mask_grueso():
-    solid = np.zeros((Nx, Ny), dtype=bool)
-    solid[0:10, 6:9] = True       # obstáculo superior izquierdo (i<=9, j>=6)
-    solid[35:45, 0:2] = True      # obstáculo inferior central (35<=i<=44, j<=1)
-    return solid
+def resolver_vorticidad(Nx, Ny, h, U0, nu, dt, max_iter, tol):
+    i_idx, j_idx = np.meshgrid(np.arange(Nx), np.arange(Ny), indexing="ij")
+    X, Y = i_idx * h, j_idx * h
 
+    # --- obstáculos de tamaño REAL (Newton-Raphson) ---
+    obstaculo1 = (X <= 100.0) & (Y >= 25.0)          # x:[0,100]   y:[25,40]
+    obstaculo2 = (X >= 150.0) & (X <= 250.0) & (Y <= 15.0)  # x:[150,250] y:[0,15]
+    solid = obstaculo1 | obstaculo2
 
-obstaculo = build_solid_mask_grueso()
-fijo = obstaculo.copy()
-fijo[0, :] = True                 # entrada del canal (condición fija)
+    y_open = np.argmax(obstaculo1[0, :]) * h if obstaculo1[0, :].any() else Ly
+    Psi_top, Psi_bottom = U0 * y_open, 0.0
+
+    # --- condiciones de frontera para psi ---
+    category = np.full((Nx, Ny), "interior", dtype=object)
+    dir_val = np.zeros((Nx, Ny))
+    category[Nx - 1, :] = "neumann"
+    category[0, :] = "dirichlet"; dir_val[0, :] = U0 * (j_idx[0, :] * h)
+    category[obstaculo1] = "dirichlet"; dir_val[obstaculo1] = Psi_top
+    category[obstaculo2] = "dirichlet"; dir_val[obstaculo2] = Psi_bottom
+    category[:, Ny - 1] = "dirichlet"; dir_val[:, Ny - 1] = Psi_top
+    category[:, 0] = "dirichlet"; dir_val[:, 0] = Psi_bottom
+
+    # --- matriz de Poisson (se arma y factoriza una sola vez) ---
+    idx = i_idx * Ny + j_idx
+    N = Nx * Ny
+    rows, cols, data = [], [], []
+    b_fixed = np.zeros(N)
+
+    dmask = category == "dirichlet"
+    dnodes = idx[dmask]
+    rows += list(dnodes); cols += list(dnodes); data += [1.0] * len(dnodes)
+    b_fixed[dnodes] = dir_val[dmask]
+
+    nmask = category == "neumann"
+    nnodes = idx[nmask]
+    wnodes = idx[Nx - 2, j_idx[nmask]]
+    rows += list(nnodes); cols += list(nnodes); data += [1.0] * len(nnodes)
+    rows += list(nnodes); cols += list(wnodes); data += [-1.0] * len(nnodes)
+
+    imask = category == "interior"
+    ii, jj = np.where(imask)
+    node = idx[ii, jj]
+    E, W = idx[ii + 1, jj], idx[ii - 1, jj]
+    Nn, S = idx[ii, jj + 1], idx[ii, jj - 1]
+    rows += list(node); cols += list(node); data += [-4.0] * len(node)
+    rows += list(node); cols += list(E); data += [1.0] * len(node)
+    rows += list(node); cols += list(W); data += [1.0] * len(node)
+    rows += list(node); cols += list(Nn); data += [1.0] * len(node)
+    rows += list(node); cols += list(S); data += [1.0] * len(node)
+
+    A = coo_matrix((data, (rows, cols)), shape=(N, N)).tocsc()
+    lu = splu(A)
+
+    psi = dir_val.copy()
+    omega = np.zeros((Nx, Ny))
+
+    wallish = solid.copy()
+    wallish[:, 0] = True
+    wallish[:, -1] = True
+    evolve = (~wallish).copy()
+    evolve[0, :] = False
+    evolve[-1, :] = False
+
+    north_fluid = np.zeros_like(wallish); north_fluid[:, :-1] = ~wallish[:, 1:]
+    south_fluid = np.zeros_like(wallish); south_fluid[:, 1:] = ~wallish[:, :-1]
+    east_fluid = np.zeros_like(wallish); east_fluid[:-1, :] = ~wallish[1:, :]
+    west_fluid = np.zeros_like(wallish); west_fluid[1:, :] = ~wallish[:-1, :]
+
+    t0 = time.time()
+    for it in range(max_iter):
+        u_full = np.zeros_like(psi); u_full[:, 1:-1] = (psi[:, 2:] - psi[:, :-2]) / (2 * h)
+        v_full = np.zeros_like(psi); v_full[1:-1, :] = -(psi[2:, :] - psi[:-2, :]) / (2 * h)
+
+        domega_dx = np.zeros_like(omega); domega_dx[1:-1, :] = (omega[2:, :] - omega[:-2, :]) / (2 * h)
+        domega_dy = np.zeros_like(omega); domega_dy[:, 1:-1] = (omega[:, 2:] - omega[:, :-2]) / (2 * h)
+        lap_omega = np.zeros_like(omega)
+        lap_omega[1:-1, 1:-1] = (
+            omega[2:, 1:-1] + omega[:-2, 1:-1] + omega[1:-1, 2:] + omega[1:-1, :-2] - 4 * omega[1:-1, 1:-1]
+        ) / h ** 2
+
+        rhs = -(u_full * domega_dx + v_full * domega_dy) + nu * lap_omega
+        omega_new = omega.copy()
+        omega_new[evolve] = omega[evolve] + dt * rhs[evolve]
+
+        psi_n = np.zeros_like(psi); psi_n[:, :-1] = psi[:, 1:]
+        psi_s = np.zeros_like(psi); psi_s[:, 1:] = psi[:, :-1]
+        psi_e = np.zeros_like(psi); psi_e[:-1, :] = psi[1:, :]
+        psi_w = np.zeros_like(psi); psi_w[1:, :] = psi[:-1, :]
+
+        term_n = 2 * (psi - psi_n) / h ** 2 * north_fluid
+        term_s = 2 * (psi - psi_s) / h ** 2 * south_fluid
+        term_e = 2 * (psi - psi_e) / h ** 2 * east_fluid
+        term_w = 2 * (psi - psi_w) / h ** 2 * west_fluid
+        cnt = north_fluid.astype(float) + south_fluid + east_fluid + west_fluid
+        omega_wall = np.where(cnt > 0, (term_n + term_s + term_e + term_w) / np.maximum(cnt, 1), 0.0)
+        omega_new[wallish] = omega_wall[wallish]
+
+        omega_new[0, :][~wallish[0, :]] = 0.0
+        omega_new[-1, :] = omega_new[-2, :]
+
+        b = b_fixed.copy()
+        b[node] = -omega_new[ii, jj] * h ** 2
+        psi_new = lu.solve(b).reshape(Nx, Ny)
+
+        diff = np.max(np.abs(psi_new - psi)) / (np.max(np.abs(psi_new)) + 1e-12)
+        psi, omega = psi_new, omega_new
+        if it % 200 == 0:
+            print(f"    it={it:5d}  cambio relativo = {diff:.3e}")
+        if diff < tol:
+            print(f"    Convergió en {it} iteraciones ({time.time()-t0:.2f} s)")
+            break
+
+    return psi, omega, solid
+
 
 # ==========================================================================
-# 3. CAMPO DE VELOCIDADES INICIAL
+# 3. RESOLVER EN LA MALLA GRUESA (h = 5)
 # ==========================================================================
-u = np.ones((Nx, Ny)) * U0
-u[0, :] = U0
-u[obstaculo] = 0.0
+print("\nResolviendo en la malla gruesa (Gauss-Seidel reemplazado por vorticidad-psi)...")
+psi_grueso, omega_grueso, solid_grueso = resolver_vorticidad(
+    Nx_g, Ny_g, h_grueso, U0=U0, nu=nu, dt=1.0, max_iter=4000, tol=1e-6
+)
 
-# ==========================================================================
-# 4. SOLUCIÓN ITERATIVA (GAUSS-SEIDEL / SOR) SOBRE LA MALLA GRUESA
-# ==========================================================================
-print("\nResolviendo con Gauss-Seidel (SOR) en la malla gruesa...")
-for it in range(max_iter):
-    # --------------------------------------
-    # paredes impermeables (gradiente nulo)
-    # --------------------------------------
-    u[:, 0] = u[:, 1]
-    u[:, -1] = u[:, -2]
-    # --------------------------------------
-    # salida con gradiente nulo
-    # --------------------------------------
-    u[-1, :] = u[-2, :]
-    u[-2, :] = u[-3, :]
-    u[-3, :] = u[-4, :]
-
-    error = 0.0
-    for i in range(1, Nx - 1):
-        for j in range(1, Ny - 1):
-            if fijo[i, j]:
-                continue
-
-            laplace = (
-                u[i + 1, j] +
-                u[i - 1, j] +
-                u[i, j + 1] +
-                u[i, j - 1]
-            ) / 4.0
-            laplace += g * (u[i - 1, j] - u[i, j])
-
-            nuevo = omega * laplace + (1 - omega) * u[i, j]
-            error = max(error, abs(nuevo - u[i, j]))
-            u[i, j] = nuevo
-
-    if it % 500 == 0:
-        print(f"  Iteración {it:5d}   Error = {error:.3e}")
-    if error < tol:
-        print(f"\n  Convergió en {it} iteraciones (Error = {error:.3e})")
-        break
-
-u[obstaculo] = 0.0
-u_grueso = u.copy()
-
-print("\nResultados en la malla gruesa (81 x 9)")
-print("  Velocidad mínima :", np.nanmin(u_grueso))
-print("  Velocidad máxima :", np.nanmax(u_grueso))
-print("  Velocidad media  :", np.nanmean(u_grueso))
+dpsidx_g, dpsidy_g = np.gradient(psi_grueso, h_grueso)
+u_grueso, v_grueso = dpsidy_g.copy(), -dpsidx_g.copy()
+u_grueso[solid_grueso] = 0.0
+v_grueso[solid_grueso] = 0.0
+speed_grueso = np.sqrt(u_grueso ** 2 + v_grueso ** 2)
 
 # ==========================================================================
-# 5. RECUPERACIÓN DEL TAMAÑO ORIGINAL MEDIANTE SPLINE CÚBICO NATURAL
-#    Se interpola de forma separable (2D = spline en x seguido de spline
-#    en y), usando bc_type="natural" en ambos pasos, para llevar la
-#    solución de la malla gruesa (h = 5) a la resolución original del
-#    canal (h = 1), es decir, de 400 x 40 unidades reales.
+# 4. RECUPERACIÓN DEL TAMAÑO ORIGINAL CON SPLINE CÚBICO NATURAL
 # ==========================================================================
 print("\n" + "=" * 70)
-print("  Interpolando con Spline Cúbico Natural (recuperando tamaño original)")
+print("  Recuperando tamaño original (h = 1) con Spline Cúbico Natural")
 print("=" * 70)
 
-# Coordenadas reales de la malla gruesa (donde se calculó la solución)
-x_grueso = np.arange(Nx) * h_real          # 0, 5, 10, ..., 400
-y_grueso = np.arange(Ny) * h_real          # 0, 5, ..., 40
+x_grueso = np.arange(Nx_g) * h_grueso
+y_grueso = np.arange(Ny_g) * h_grueso
+x_fino = np.arange(0, Lx + 1, h_fino)
+y_fino = np.arange(0, Ly + 1, h_fino)
 
-# Coordenadas de la malla fina = tamaño ORIGINAL del canal (resolución 1)
-x_fino = np.arange(0, Lx + 1, 1.0)         # 0, 1, 2, ..., 400  (401 puntos)
-y_fino = np.arange(0, Ly + 1, 1.0)         # 0, 1, 2, ...,  40  ( 41 puntos)
+# --- paso 1: spline natural a lo largo de x, para cada fila j ---
+psi_paso_x = np.zeros((len(x_fino), Ny_g))
+for j in range(Ny_g):
+    spline_x = CubicSpline(x_grueso, psi_grueso[:, j], bc_type="natural")
+    psi_paso_x[:, j] = spline_x(x_fino)
 
-# --- Paso 1: interpolación cúbica natural a lo largo de x, para cada fila j ---
-u_paso_x = np.zeros((len(x_fino), Ny))
-for j in range(Ny):
-    spline_x = CubicSpline(x_grueso, u_grueso[:, j], bc_type="natural")
-    u_paso_x[:, j] = spline_x(x_fino)
-
-# --- Paso 2: interpolación cúbica natural a lo largo de y, para cada columna fina de x ---
-u_fino = np.zeros((len(x_fino), len(y_fino)))
+# --- paso 2: spline natural a lo largo de y ---
+psi_fino = np.zeros((len(x_fino), len(y_fino)))
 for i in range(len(x_fino)):
-    spline_y = CubicSpline(y_grueso, u_paso_x[i, :], bc_type="natural")
-    u_fino[i, :] = spline_y(y_fino)
+    spline_y = CubicSpline(y_grueso, psi_paso_x[i, :], bc_type="natural")
+    psi_fino[i, :] = spline_y(y_fino)
 
+# (opcional, solo para graficar) se recupera también la vorticidad con el
+# mismo procedimiento, para poder mostrar el mapa de vorticidad en h = 1
+omega_paso_x = np.zeros((len(x_fino), Ny_g))
+for j in range(Ny_g):
+    spline_x = CubicSpline(x_grueso, omega_grueso[:, j], bc_type="natural")
+    omega_paso_x[:, j] = spline_x(x_fino)
+omega_fino = np.zeros((len(x_fino), len(y_fino)))
+for i in range(len(x_fino)):
+    spline_y = CubicSpline(y_grueso, omega_paso_x[i, :], bc_type="natural")
+    omega_fino[i, :] = spline_y(y_fino)
+
+# --- velocidades en la malla fina, derivadas del psi YA interpolado ---
+dpsidx, dpsidy = np.gradient(psi_fino, h_fino)
+u_fino, v_fino = dpsidy.copy(), -dpsidx.copy()
+
+# --- máscara de obstáculos en la malla fina (mismo tamaño real, sin reescalar) ---
 X_fino, Y_fino = np.meshgrid(x_fino, y_fino, indexing="ij")
-obstaculo_fino = np.zeros_like(u_fino, dtype=bool)
-obstaculo_fino |= (X_fino <= 45.0) & (Y_fino >= 30.0)
-obstaculo_fino |= (X_fino >= 175.0) & (X_fino <= 220.0) & (Y_fino <= 5.0)
+obstaculo1_fino = (X_fino <= 100.0) & (Y_fino >= 25.0)
+obstaculo2_fino = (X_fino >= 150.0) & (X_fino <= 250.0) & (Y_fino <= 15.0)
+solid_fino = obstaculo1_fino | obstaculo2_fino
 
-u_fino[obstaculo_fino] = 0.0
+u_fino[solid_fino] = 0.0
+v_fino[solid_fino] = 0.0
+speed_fino = np.sqrt(u_fino ** 2 + v_fino ** 2)
 
 print(f"  Malla original recuperada: {len(x_fino)} x {len(y_fino)} puntos "
-      f"({Lx:.0f} x {Ly:.0f} unidades, h = 1)")
+      f"({Lx:.0f} x {Ly:.0f} unidades, h = {h_fino})")
 print("\nResultados en la malla de tamaño original (interpolada)")
-print("  Velocidad mínima :", np.nanmin(u_fino))
-print("  Velocidad máxima :", np.nanmax(u_fino))
-print("  Velocidad media  :", np.nanmean(u_fino))
+print("  Velocidad mínima :", np.nanmin(speed_fino))
+print("  Velocidad máxima :", np.nanmax(speed_fino))
+print("  Velocidad media  :", np.nanmean(speed_fino[~solid_fino]))
 
-def _mapear_a_identidad(distancia, rango_destino, rango_real, transicion):
-    distancia = np.asarray(distancia, dtype=float)
-    fuente = np.empty_like(distancia)
-
-    m1 = distancia <= rango_destino
-    fuente[m1] = distancia[m1] * (rango_real / rango_destino)
-
-    m2 = (distancia > rango_destino) & (distancia <= rango_destino + transicion)
-    t = (distancia[m2] - rango_destino) / transicion
-    fuente[m2] = (1 - t) * rango_real + t * distancia[m2]
-
-    m3 = distancia > rango_destino + transicion
-    fuente[m3] = distancia[m3]
-    return fuente
-
-
-def _desvanecer(distancia, inicio, fin):
-    """1.0 cerca del obstáculo (distancia<=inicio), 0.0 lejos (distancia>=fin)."""
-    distancia = np.asarray(distancia, dtype=float)
-    t = np.clip((distancia - inicio) / (fin - inicio), 0.0, 1.0)
-    return 1.0 - t
-
-
-def calcular_coordenadas_fuente(X, Y, escala_transicion=1.0):
-    X0_1, GS_ANCHO_1 = 100.0, 45.0
-    D0_1, GS_ALTO_1 = 15.0, 10.0
-    TX_1 = 30.0 * escala_transicion
-    TY_1 = 8.0 * escala_transicion
-
-    dist_x1 = X
-    prof_out1 = Ly - Y
-
-    fuente_x1 = _mapear_a_identidad(dist_x1.ravel(), X0_1, GS_ANCHO_1, TX_1).reshape(dist_x1.shape)
-    fuente_prof1 = _mapear_a_identidad(prof_out1.ravel(), D0_1, GS_ALTO_1, TY_1).reshape(prof_out1.shape)
-
-    alpha1 = _desvanecer(prof_out1, D0_1, D0_1 + TY_1)
-    beta1 = _desvanecer(dist_x1, X0_1, X0_1 + TX_1)
-
-    x_src1 = dist_x1 - alpha1 * (dist_x1 - fuente_x1)
-    prof_src1 = prof_out1 - beta1 * (prof_out1 - fuente_prof1)
-    y_src1 = Ly - prof_src1
-    w1 = alpha1 * beta1
-
-    CX2 = 200.0
-    X0_2, GS_ANCHO_2 = 50.0, 22.5
-    D0_2, GS_ALTO_2 = 15.0, 5.0
-    TX_2 = 20.0 * escala_transicion
-    TY_2 = 6.0 * escala_transicion
-
-    dist_x2 = np.abs(X - CX2)
-    signo2 = np.sign(X - CX2)
-    prof_out2 = Y
-
-    fuente_x2 = _mapear_a_identidad(dist_x2.ravel(), X0_2, GS_ANCHO_2, TX_2).reshape(dist_x2.shape)
-    fuente_prof2 = _mapear_a_identidad(prof_out2.ravel(), D0_2, GS_ALTO_2, TY_2).reshape(prof_out2.shape)
-
-    alpha2 = _desvanecer(prof_out2, D0_2, D0_2 + TY_2)
-    beta2 = _desvanecer(dist_x2, X0_2, X0_2 + TX_2)
-
-    x_src2 = CX2 + signo2 * (dist_x2 - alpha2 * (dist_x2 - fuente_x2))
-    y_src2 = prof_out2 - beta2 * (prof_out2 - fuente_prof2)
-    w2 = alpha2 * beta2
-
-    w0 = np.clip(1.0 - w1 - w2, 0.0, 1.0)
-    suma_pesos = w0 + w1 + w2
-    x_fuente = (w0 * X + w1 * x_src1 + w2 * x_src2) / suma_pesos
-    y_fuente = (w0 * Y + w1 * y_src1 + w2 * y_src2) / suma_pesos
-
-    x_fuente = np.clip(x_fuente, 0.0, Lx)
-    y_fuente = np.clip(y_fuente, 0.0, Ly)
-    return x_fuente, y_fuente
-
-
-x_src_fino, y_src_fino = calcular_coordenadas_fuente(X_fino, Y_fino, escala_transicion=0.7)
-
-_interp_visual_fino = RegularGridInterpolator(
-    (x_fino, y_fino), u_fino, bounds_error=False, fill_value=None
-)
-_puntos_fino = np.column_stack([x_src_fino.ravel(), y_src_fino.ravel()])
-u_plot = _interp_visual_fino(_puntos_fino).reshape(X_fino.shape)
-
-X_grueso, Y_grueso = np.meshgrid(x_grueso, y_grueso, indexing="ij")
-
-ESCALA_TRANSICION_GRUESO = 0.7
-
-x_src_grueso, y_src_grueso = calcular_coordenadas_fuente(
-    X_grueso, Y_grueso, escala_transicion=ESCALA_TRANSICION_GRUESO
-)
-
-_interp_visual_grueso = RegularGridInterpolator(
-    (x_grueso, y_grueso), u_grueso, method="nearest", bounds_error=False, fill_value=None
-)
-_puntos_grueso = np.column_stack([x_src_grueso.ravel(), y_src_grueso.ravel()])
-u_grueso_plot = _interp_visual_grueso(_puntos_grueso).reshape(X_grueso.shape)
 
 # ==========================================================================
-# 7. VISUALIZACIÓN - MAPAS DE CALOR
+# 5. VISUALIZACIÓN
 # ==========================================================================
+def dibujar_obstaculos(ax):
+    ax.add_patch(patches.Rectangle((0, 25), 100, 15, facecolor="black", zorder=5))
+    ax.add_patch(patches.Rectangle((150, 0), 100, 15, facecolor="black", zorder=5))
 
 
-def dibujar_obstaculos_nr(ax):
-    """Obstáculos dibujados con el tamaño de Newton-Raphson (solo visual)."""
-    ax.add_patch(patches.Rectangle((0, 25), 100, 15, facecolor="black"))
-    ax.add_patch(patches.Rectangle((150, 0), 100, 15, facecolor="black"))
-
-
-fig1b, ax1b = plt.subplots(figsize=(18, 4))
-im1b = ax1b.imshow(
-    u_grueso_plot.T,
-    origin="lower",
-    extent=[0, Lx, 0, Ly],
-    cmap="turbo",
-    aspect="auto",
-    interpolation="nearest",
-    vmin=0,
-    vmax=U0,
+# --- malla gruesa (h = 5), tal como salió del solver ---
+fig1, ax1 = plt.subplots(figsize=(18, 4))
+im1 = ax1.imshow(
+    speed_grueso.T, origin="lower", extent=[0, Lx, 0, Ly],
+    cmap="turbo", aspect="auto", interpolation="nearest", vmin=0, vmax=np.nanmax(speed_fino),
 )
-fig1b.colorbar(im1b, ax=ax1b, label="Velocidad u [m/s]")
-dibujar_obstaculos_nr(ax1b)
-ax1b.set_title("Malla discretizada (h = 5) - Gauss-Seidel")
-ax1b.set_xlabel("x [m]")
-ax1b.set_ylabel("y [m]")
-ax1b.set_xlim(0, Lx)
-ax1b.set_ylim(0, Ly)
-fig1b.tight_layout()
+fig1.colorbar(im1, ax=ax1, label="Velocidad |u| [m/s]")
+dibujar_obstaculos(ax1)
+ax1.set_title(f"Malla gruesa discretizada (h = {h_grueso:.0f})")
+ax1.set_xlabel("x [m]"); ax1.set_ylabel("y [m]")
+ax1.set_xlim(0, Lx); ax1.set_ylim(0, Ly)
+fig1.tight_layout()
 
-# --- Mapa de calor: tamaño original recuperado (spline cúbico natural) ---
+# --- malla fina recuperada (h = 1), con líneas de corriente ---
 fig2, ax2 = plt.subplots(figsize=(18, 4))
 im2 = ax2.imshow(
-    u_plot.T,
-    origin="lower",
-    extent=[0, Lx, 0, Ly],
-    cmap="turbo",
-    aspect="auto",
-    interpolation="bilinear",
-    vmin=0,
-    vmax=U0,
+    speed_fino.T, origin="lower", extent=[0, Lx, 0, Ly],
+    cmap="turbo", aspect="auto", interpolation="bilinear", vmin=0, vmax=np.nanmax(speed_fino),
 )
-fig2.colorbar(im2, ax=ax2, label="Velocidad u [m/s]")
-dibujar_obstaculos_nr(ax2)
-ax2.set_title("Tamaño original recuperado (h = 1) - Spline Cúbico Natural")
-ax2.set_xlabel("x [m]")
-ax2.set_ylabel("y [m]")
-ax2.set_xlim(0, Lx)
-ax2.set_ylim(0, Ly)
+fig2.colorbar(im2, ax=ax2, label="Velocidad |u| [m/s]")
+
+u_plot = u_fino.T.copy(); v_plot = v_fino.T.copy()
+u_plot[solid_fino.T] = np.nan
+v_plot[solid_fino.T] = np.nan
+ax2.streamplot(x_fino, y_fino, u_plot, v_plot, color="white", density=1.4, linewidth=0.6, arrowsize=0.8)
+
+dibujar_obstaculos(ax2)
+ax2.set_title(f"Tamaño original recuperado (h = {h_fino:.0f}) - Spline Cúbico Natural")
+ax2.set_xlabel("x [m]"); ax2.set_ylabel("y [m]")
+ax2.set_xlim(0, Lx); ax2.set_ylim(0, Ly)
 fig2.tight_layout()
+
+# --- vorticidad: mismo rango de color en las dos mallas, para poder comparar ---
+vlim = np.nanpercentile(np.abs(omega_fino[~solid_fino]), 98)
+
+# malla gruesa (h = 5)
+fig3, ax3 = plt.subplots(figsize=(18, 4))
+im3 = ax3.imshow(
+    omega_grueso.T, origin="lower", extent=[0, Lx, 0, Ly],
+    cmap="RdBu_r", aspect="auto", interpolation="nearest", vmin=-vlim, vmax=vlim,
+)
+fig3.colorbar(im3, ax=ax3, label="Vorticidad omega [1/s]")
+dibujar_obstaculos(ax3)
+ax3.set_title(f"Campo de vorticidad - malla gruesa (h = {h_grueso:.0f})")
+ax3.set_xlabel("x [m]"); ax3.set_ylabel("y [m]")
+ax3.set_xlim(0, Lx); ax3.set_ylim(0, Ly)
+fig3.tight_layout()
+
+# malla fina recuperada (h = 1)
+fig4, ax4 = plt.subplots(figsize=(18, 4))
+im4 = ax4.imshow(
+    omega_fino.T, origin="lower", extent=[0, Lx, 0, Ly],
+    cmap="RdBu_r", aspect="auto", interpolation="bilinear", vmin=-vlim, vmax=vlim,
+)
+fig4.colorbar(im4, ax=ax4, label="Vorticidad omega [1/s]")
+dibujar_obstaculos(ax4)
+ax4.set_title(f"Campo de vorticidad recuperado (h = {h_fino:.0f}) - Spline Cúbico Natural")
+ax4.set_xlabel("x [m]"); ax4.set_ylabel("y [m]")
+ax4.set_xlim(0, Lx); ax4.set_ylim(0, Ly)
+fig4.tight_layout()
 
 plt.show()
